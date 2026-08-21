@@ -68,6 +68,19 @@ async def init_db():
             crimes_failed INTEGER DEFAULT 0
         )
         """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS duel_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            challenger_id INTEGER,
+            opponent_id INTEGER,
+            challenger_choice TEXT,
+            opponent_choice TEXT,
+            stake INTEGER,
+            result TEXT,
+            winner_id INTEGER,
+            created_at INTEGER
+        )
+        """)
         await db.commit()
 
 async def ensure_user(user_id: int):
@@ -262,3 +275,38 @@ async def get_cooldown(user_id: int, command: str):
         cur = await db.execute("SELECT last_used FROM cooldowns WHERE user_id = ? AND command = ?", (user_id, command))
         row = await cur.fetchone()
         return row[0] if row else 0
+
+async def log_duel(challenger_id: int, opponent_id: int, challenger_choice: str, opponent_choice: str, stake: int, result: str, winner_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO duel_history(challenger_id, opponent_id, challenger_choice, opponent_choice, stake, result, winner_id, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (challenger_id, opponent_id, challenger_choice, opponent_choice, stake, result, winner_id, int(time.time())),
+        )
+        await db.commit()
+
+async def get_duel_history(limit: int = 10):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT challenger_id, opponent_id, challenger_choice, opponent_choice, stake, result, winner_id, created_at FROM duel_history ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return await cur.fetchall()
+
+async def get_duel_stats(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN winner_id = ? THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN winner_id != ? AND (challenger_id = ? OR opponent_id = ?) THEN 1 ELSE 0 END) AS losses,
+                COUNT(*) AS total
+            FROM duel_history
+            WHERE challenger_id = ? OR opponent_id = ?
+            """,
+            (user_id, user_id, user_id, user_id, user_id, user_id),
+        )
+        row = await cur.fetchone()
+        wins = row[0] or 0
+        losses = row[1] or 0
+        total = row[2] or 0
+        return {'wins': wins, 'losses': losses, 'total': total, 'winrate': round((wins / total * 100), 1) if total else 0}

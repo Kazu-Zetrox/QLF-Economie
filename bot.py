@@ -11,9 +11,11 @@ import io
 import html
 import re
 import aiohttp
+from aiohttp import web
 from datetime import datetime, timedelta
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 import db
@@ -71,6 +73,7 @@ SHOP_ITEMS = {
 }
 
 QLF_BLUE = 0x5865F2
+ADMIN_MENU_CHANNEL_ID = 1539936706130612254
 
 async def resolve_video_url(url: str):
     clean_url = url.lower().split('?')[0]
@@ -174,9 +177,42 @@ ACHIEVEMENT_CATEGORIES = {
     'diamond': 'Prestige', 'royal': 'Prestige', 'rainbow': 'Prestige', 'galaxy': 'Prestige', 'cosmic': 'Prestige', 'premium_trio': 'Prestige', 'ultimate_style': 'Prestige',
 }
 
+PENDING_DUELS = {}
+
+async def action_dm(member: discord.Member, action: str, moderator: discord.Member, reason: str, server_name: str, duration: str = None, extra_text: str = None):
+    if not member or member.bot:
+        return
+    embed = discord.Embed(
+        title=f"Tu as été {action} sur {server_name}",
+        description=f"Raison : **{reason}**",
+        color=discord.Color.dark_red() if action in ('banni', 'expulsé', 'warn') else discord.Color.orange(),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    if duration:
+        embed.add_field(name='⏳ Durée', value=duration, inline=True)
+    joined_at = member.joined_at
+    if joined_at:
+        joined_ts = int(joined_at.timestamp())
+        embed.add_field(name='📅 Arrivé le', value=f"<t:{joined_ts}:F>", inline=True)
+        delta = datetime.utcnow() - joined_at.replace(tzinfo=None)
+        embed.add_field(name='⏱️ Temps sur le serveur', value=f"{humanize_duration(int(delta.total_seconds()))}", inline=True)
+    embed.add_field(name='👑 Modérateur', value=moderator.mention, inline=True)
+    if extra_text:
+        embed.add_field(name='ℹ️ Info', value=extra_text, inline=False)
+    embed.set_footer(text='Contacte un administrateur pour toute question.')
+    try:
+        await member.send(embed=embed)
+    except discord.Forbidden:
+        pass
+
 @bot.event
 async def on_ready():
     await db.init_db()
+    try:
+        for guild in bot.guilds:
+            await bot.tree.sync(guild=guild)
+    except Exception:
+        pass
     print(f'Logged in as {bot.user}')
 
 def check_cooldown(user_id: int, command: str):
@@ -193,6 +229,51 @@ def video_view(video_url: str):
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label='Ouvrir la vidéo', emoji='▶️', style=discord.ButtonStyle.link, url=video_url))
     return view
+
+
+def humanize_duration(seconds: int):
+    if seconds <= 0:
+        return '0 seconde'
+    parts = []
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        parts.append(f'{days}j')
+    if hours:
+        parts.append(f'{hours}h')
+    if minutes:
+        parts.append(f'{minutes}min')
+    if secs and not parts:
+        parts.append(f'{secs}s')
+    return ' '.join(parts) if parts else '0 seconde'
+
+
+async def notify_member_action(member: discord.Member, action: str, moderator: discord.Member, reason: str, server_name: str, duration: str = None):
+    if not member or member.bot:
+        return
+    embed = discord.Embed(
+        title=f"Tu as été {action} de {server_name}",
+        description=f"Raison : **{reason}**",
+        color=discord.Color.dark_red() if action in ('banni', 'expulsé') else discord.Color.orange(),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    joined_at = member.joined_at
+    if joined_at:
+        joined_ts = int(joined_at.timestamp())
+        delta = datetime.utcnow() - joined_at.replace(tzinfo=None)
+        embed.add_field(name='⏱️ Temps sur le serveur', value=f"{humanize_duration(int(delta.total_seconds()))}", inline=True)
+        embed.add_field(name='📅 Arrivé le', value=f"<t:{joined_ts}:F>", inline=True)
+    embed.add_field(name='👑 Modérateur', value=moderator.mention, inline=True)
+    embed.add_field(name='🆔 ID', value=str(member.id), inline=True)
+    if duration:
+        embed.add_field(name='⏳ Durée', value=duration, inline=True)
+    embed.set_footer(text='Si tu veux contester cette décision, contacte un administrateur.')
+    try:
+        await member.send(embed=embed)
+    except discord.Forbidden:
+        pass
+
 
 @bot.command()
 async def balance(ctx):
@@ -458,9 +539,484 @@ async def setvideo(ctx, video_url: str = None):
     else:
         await ctx.send("Vidéo enregistrée. ✅")
 
+@bot.tree.command(name='kick', description='Expulser un membre du serveur')
+@app_commands.describe(member='Le membre à expulser', reason='Raison de l\'expulsion')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = 'Aucune raison fournie'):
+    await interaction.guild.kick(member, reason=reason)
+    await notify_member_action(member, 'expulsé', interaction.user, reason, interaction.guild.name)
+    await interaction.response.send_message(f'{member.mention} a été expulsé pour : {reason}', ephemeral=True)
+
+
+@bot.tree.command(name='ban', description='Bannir un membre du serveur')
+@app_commands.describe(member='Le membre à bannir', reason='Raison du bannissement', delete_days='Nombre de jours de messages à supprimer')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = 'Aucune raison fournie', delete_days: int = 0):
+    await interaction.guild.ban(member, reason=reason, delete_message_days=max(0, min(delete_days, 7)))
+    await notify_member_action(member, 'banni', interaction.user, reason, interaction.guild.name)
+    await interaction.response.send_message(f'{member.mention} a été banni pour : {reason}', ephemeral=True)
+
+
+@bot.tree.command(name='mute', description='Rendre un membre muet temporairement')
+@app_commands.describe(member='Le membre à rendre muet', duration='Durée du mute, par exemple 10m, 1h, 24h', reason='Raison du mute')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_mute(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = 'Aucune raison fournie'):
+    value = duration.strip().lower()
+    multiplier = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+    match = re.fullmatch(r'(?i)(\d+)([smhd])', value)
+    if not match:
+        await interaction.response.send_message('Format invalide. Exemple : `10m`, `1h`, `24h`.', ephemeral=True)
+        return
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    seconds = amount * multiplier[unit]
+    timeout_delta = timedelta(seconds=seconds)
+    try:
+        await member.timeout(timeout_delta, reason=reason)
+    except Exception:
+        await interaction.response.send_message('Je ne peux pas mute ce membre.', ephemeral=True)
+        return
+    await notify_member_action(member, 'mis en mute', interaction.user, reason, interaction.guild.name, f'{amount}{unit}')
+    await interaction.response.send_message(f'{member.mention} a été mute pendant {amount}{unit} pour : {reason}', ephemeral=True)
+
+
 @bot.command(name='ping')
 async def ping(ctx):
     await ctx.send(f"Pong ! Latence: {round(bot.latency * 1000)} ms")
+
+
+async def parse_duration(value: str):
+    value = value.strip().lower()
+    if not value:
+        return None
+    match = re.fullmatch(r'(\d+)([smhd])', value)
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multipliers = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+    return amount * multipliers[unit]
+
+
+@bot.command(name='ban', aliases=['bannir'])
+@commands.has_permissions(administrator=True)
+async def ban_cmd(ctx, member: discord.Member = None, *, reason: str = 'Aucune raison fournie'):
+    if member is None:
+        await ctx.send('Utilise : `!ban @membre [raison]`')
+        return
+    if member.id == ctx.author.id:
+        await ctx.send('Tu ne peux pas te bannir toi-même.')
+        return
+    await ctx.guild.ban(member, reason=reason, delete_message_days=0)
+    await action_dm(member, 'banni', ctx.author, reason, ctx.guild.name)
+    await ctx.send(f'{member.mention} a été banni pour : {reason}')
+
+
+@bot.command(name='kick', aliases=['expulser'])
+@commands.has_permissions(administrator=True)
+async def kick_cmd(ctx, member: discord.Member = None, *, reason: str = 'Aucune raison fournie'):
+    if member is None:
+        await ctx.send('Utilise : `!kick @membre [raison]`')
+        return
+    if member.id == ctx.author.id:
+        await ctx.send('Tu ne peux pas te kicker toi-même.')
+        return
+    await ctx.guild.kick(member, reason=reason)
+    await action_dm(member, 'expulsé', ctx.author, reason, ctx.guild.name)
+    await ctx.send(f'{member.mention} a été expulsé pour : {reason}')
+
+
+@bot.command(name='mute', aliases=['muter'])
+@commands.has_permissions(administrator=True)
+async def mute_cmd(ctx, member: discord.Member = None, duration: str = None, *, reason: str = 'Aucune raison fournie'):
+    if member is None:
+        await ctx.send('Utilise : `!mute @membre 10m [raison]`')
+        return
+    if duration is None:
+        await ctx.send('Précise une durée : `10m`, `1h`, `24h`.')
+        return
+    seconds = await parse_duration(duration)
+    if seconds is None:
+        await ctx.send('Format invalide. Exemple : `10m`, `1h`, `24h`.')
+        return
+    try:
+        await member.timeout(timedelta(seconds=seconds), reason=reason)
+    except Exception:
+        await ctx.send('Je ne peux pas mute ce membre.')
+        return
+    await action_dm(member, 'mis en mute', ctx.author, reason, ctx.guild.name, duration)
+    await ctx.send(f'{member.mention} a été mute pendant {duration} pour : {reason}')
+
+
+@bot.command(name='unmute', aliases=['demute'])
+@commands.has_permissions(administrator=True)
+async def unmute_cmd(ctx, member: discord.Member = None, *, reason: str = 'Aucune raison fournie'):
+    if member is None:
+        await ctx.send('Utilise : `!unmute @membre [raison]`')
+        return
+    try:
+        await member.timeout(None, reason=reason)
+    except Exception:
+        await ctx.send('Je ne peux pas unmute ce membre.')
+        return
+    await action_dm(member, 'unmute', ctx.author, reason, ctx.guild.name, extra_text='Tu as été rétabli sur le serveur.')
+    await ctx.send(f'{member.mention} a été unmute pour : {reason}')
+
+
+@bot.command(name='warn', aliases=['warm'])
+@commands.has_permissions(administrator=True)
+async def warn_cmd(ctx, member: discord.Member = None, *, reason: str = 'Aucune raison fournie'):
+    if member is None:
+        await ctx.send('Utilise : `!warn @membre [raison]`')
+        return
+    await action_dm(member, 'warn', ctx.author, reason, ctx.guild.name, extra_text='Ceci est un avertissement officiel du serveur.')
+    await ctx.send(f'{member.mention} a reçu un avertissement : {reason}')
+
+
+@bot.command(name='clear', aliases=['purge'])
+@commands.has_permissions(administrator=True)
+async def clear_cmd(ctx, amount: int = 0):
+    if amount <= 0:
+        await ctx.send('Utilise : `!clear 12` pour supprimer les 12 derniers messages.')
+        return
+    if amount > 100:
+        await ctx.send('Le nombre max est 100 messages.')
+        return
+    deleted = await ctx.channel.purge(limit=amount)
+    await ctx.send(f'🧹 {len(deleted)} messages supprimés.', delete_after=3)
+
+
+@bot.tree.command(name='clear', description='Supprimer un nombre de messages du salon')
+@app_commands.describe(count='Nombre de messages à supprimer')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_clear(interaction: discord.Interaction, count: int):
+    if count <= 0:
+        await interaction.response.send_message('Le nombre doit être supérieur à 0.', ephemeral=True)
+        return
+    if count > 100:
+        await interaction.response.send_message('Le nombre max est 100 messages.', ephemeral=True)
+        return
+    deleted = await interaction.channel.purge(limit=count)
+    await interaction.response.send_message(f'🧹 {len(deleted)} messages supprimés.', ephemeral=True)
+
+
+def normalize_choice(value: str):
+    if value is None:
+        return None
+    cleaned = value.strip().lower()
+    if cleaned in ('pair', 'paire', 'even', 'p', '0'):
+        return 'pair'
+    if cleaned in ('impair', 'odd', 'i', '1'):
+        return 'impair'
+    return None
+
+
+def draw_visual_card():
+    value = random.randint(1, 13)
+    suit = random.choice(['♠', '♥', '♦', '♣'])
+    parity = 'pair' if value % 2 == 0 else 'impair'
+    return value, suit, parity
+
+
+@bot.command(name='duel')
+async def duel(ctx, member: discord.Member = None, bet: str = '100', choice: str = None):
+    if member is None:
+        await ctx.send('Tu dois mentionner un membre avec `!duel @pseudo 100 pair`.')
+        return
+    if member.bot or member.id == ctx.author.id:
+        await ctx.send('Tu dois défier un autre membre du serveur.')
+        return
+    choice = normalize_choice(choice)
+    if choice is None:
+        await ctx.send('Choisis ton côté : `pair` ou `impair`. Exemple : `!duel @pseudo 100 pair`.')
+        return
+    try:
+        stake = int(bet)
+    except ValueError:
+        await ctx.send('La mise doit être un nombre. Exemple : `!duel @pseudo 250 pair`.')
+        return
+    if stake <= 0:
+        await ctx.send('La mise doit être supérieure à 0.')
+        return
+    challenger = await db.get_user(ctx.author.id)
+    if challenger['cash'] < stake:
+        await ctx.send(f'Tu n’as pas assez d’argent pour miser ${stake}.')
+        return
+    PENDING_DUELS[ctx.author.id] = {'target_id': member.id, 'stake': stake, 'choice': choice}
+    await ctx.send(
+        f'{ctx.author.mention} défie {member.mention} en duel pour **${stake}** avec **{choice}** !\n'
+        f'{member.mention}, accepte avec `!acc duel {ctx.author.mention} {"impair" if choice == "pair" else "pair"}`\n'
+        f'Ou refuse avec `!dec duel {ctx.author.mention}`.'
+    )
+
+
+@bot.command(name='acc', aliases=['accept'])
+async def accept_duel(ctx, *args):
+    if len(args) < 3 or args[0].lower() != 'duel':
+        await ctx.send('Utilise : `!acc duel @pseudo pair`')
+        return
+    try:
+        target = await commands.MemberConverter().convert(ctx, ' '.join(args[1:-1]))
+    except commands.BadArgument:
+        await ctx.send('Membre introuvable. Utilise `!acc duel @pseudo pair`.')
+        return
+    accept_choice = normalize_choice(args[-1])
+    if accept_choice is None:
+        await ctx.send('Choisis une option valide : `pair` ou `impair`.')
+        return
+    duel_request = PENDING_DUELS.get(target.id)
+    if not duel_request or duel_request['target_id'] != ctx.author.id:
+        await ctx.send('Aucun duel en attente avec ce membre.')
+        return
+    if accept_choice == duel_request['choice']:
+        await ctx.send(f'{ctx.author.mention}, tu dois choisir l’autre côté que {target.mention}. Le défi demande **{("impair" if duel_request["choice"] == "pair" else "pair")}**.')
+        return
+    stake = duel_request['stake']
+    target_user = await db.get_user(target.id)
+    if target_user['cash'] < stake:
+        await ctx.send(f'{target.mention} n’a pas assez d’argent pour miser ${stake}.')
+        del PENDING_DUELS[target.id]
+        return
+    if (await db.get_user(ctx.author.id))['cash'] < stake:
+        await ctx.send(f'{ctx.author.mention} n’a pas assez d’argent pour miser ${stake}.')
+        del PENDING_DUELS[target.id]
+        return
+    del PENDING_DUELS[target.id]
+    if not await db.remove_cash(target.id, stake):
+        await ctx.send(f'{target.mention} n’a plus assez d’argent pour ce duel.')
+        return
+    if not await db.remove_cash(ctx.author.id, stake):
+        await ctx.send(f'{ctx.author.mention} n’a plus assez d’argent pour ce duel.')
+        return
+    card_value, card_suit, result = draw_visual_card()
+    pot = stake * 2
+    winner_id = target.id if result == duel_request['choice'] else ctx.author.id
+    await db.change_cash(winner_id, pot)
+    await db.record_gain(winner_id, pot)
+    await db.log_duel(target.id, ctx.author.id, duel_request['choice'], accept_choice, stake, result, winner_id)
+    winner_mention = ctx.guild.get_member(winner_id).mention if ctx.guild.get_member(winner_id) else target.mention
+    await ctx.send(
+        f'{ctx.author.mention} a accepté le duel !\n'
+        f'🃏 Carte tirée : **{card_value}{card_suit}** -> **{result}**\n'
+        f'Gagnant : {winner_mention}\n'
+        f'Pot : **${pot}**'
+    )
+
+
+@bot.command(name='dec', aliases=['decline'])
+async def decline_duel(ctx, *args):
+    if len(args) < 2 or args[0].lower() != 'duel':
+        await ctx.send('Utilise : `!dec duel @pseudo`')
+        return
+    try:
+        target = await commands.MemberConverter().convert(ctx, ' '.join(args[1:]))
+    except commands.BadArgument:
+        await ctx.send('Membre introuvable. Utilise `!dec duel @pseudo`.')
+        return
+    duel_request = PENDING_DUELS.get(target.id)
+    if not duel_request or duel_request['target_id'] != ctx.author.id:
+        await ctx.send('Aucun duel en attente avec ce membre.')
+        return
+    del PENDING_DUELS[target.id]
+    await ctx.send(f'{ctx.author.mention} a refusé le duel de {target.mention}.')
+
+
+@bot.tree.command(name='duel', description='Défier un joueur en duel avec une mise d\'argent')
+@app_commands.describe(member='Le membre à défier', bet='Mise en argent du duel', choice='Choisis pair ou impair')
+async def slash_duel(interaction: discord.Interaction, member: discord.Member, bet: int, choice: str):
+    normalized_choice = normalize_choice(choice)
+    if normalized_choice is None:
+        await interaction.response.send_message('Choisis `pair` ou `impair`.', ephemeral=True)
+        return
+    if member.bot or member.id == interaction.user.id:
+        await interaction.response.send_message('Tu dois défier un autre membre du serveur.', ephemeral=True)
+        return
+    if bet <= 0:
+        await interaction.response.send_message('La mise doit être positive.', ephemeral=True)
+        return
+    user = await db.get_user(interaction.user.id)
+    if user['cash'] < bet:
+        await interaction.response.send_message(f'Tu n’as pas assez d’argent pour miser ${bet}.', ephemeral=True)
+        return
+    PENDING_DUELS[interaction.user.id] = {'target_id': member.id, 'stake': bet, 'choice': normalized_choice}
+    await interaction.response.send_message(
+        f'{interaction.user.mention} défie {member.mention} en duel pour **${bet}** avec **{normalized_choice}** !\n'
+        f'{member.mention}, accepte avec `/acceptduel {interaction.user.mention} {"impair" if normalized_choice == "pair" else "pair"}`\n'
+        f'Ou refuse avec `/declineduel {interaction.user.mention}`.',
+        ephemeral=False,
+    )
+
+
+@bot.tree.command(name='acceptduel', description='Accepter un duel avec pair ou impair')
+@app_commands.describe(member='Le membre qui a défié', choice='Choisis pair ou impair')
+async def slash_acceptduel(interaction: discord.Interaction, member: discord.Member, choice: str):
+    accept_choice = normalize_choice(choice)
+    if accept_choice is None:
+        await interaction.response.send_message('Choisis `pair` ou `impair`.', ephemeral=True)
+        return
+    duel_request = PENDING_DUELS.get(member.id)
+    if not duel_request or duel_request['target_id'] != interaction.user.id:
+        await interaction.response.send_message('Aucun duel en attente avec ce membre.', ephemeral=True)
+        return
+    if accept_choice == duel_request['choice']:
+        await interaction.response.send_message(f'Tu dois choisir l’autre côté. Le défi demandait **{("impair" if duel_request["choice"] == "pair" else "pair")}**.', ephemeral=True)
+        return
+    stake = duel_request['stake']
+    if (await db.get_user(member.id))['cash'] < stake:
+        await interaction.response.send_message(f'{member.mention} n’a pas assez d’argent pour ce duel.', ephemeral=True)
+        del PENDING_DUELS[member.id]
+        return
+    if (await db.get_user(interaction.user.id))['cash'] < stake:
+        await interaction.response.send_message(f'Tu n’as pas assez d’argent pour ce duel.', ephemeral=True)
+        del PENDING_DUELS[member.id]
+        return
+    if not await db.remove_cash(member.id, stake):
+        await interaction.response.send_message(f'{member.mention} n’a plus assez d’argent pour ce duel.', ephemeral=True)
+        return
+    if not await db.remove_cash(interaction.user.id, stake):
+        await interaction.response.send_message(f'Tu n’as plus assez d’argent pour ce duel.', ephemeral=True)
+        return
+    del PENDING_DUELS[member.id]
+    card_value, card_suit, result = draw_visual_card()
+    pot = stake * 2
+    winner_id = member.id if result == duel_request['choice'] else interaction.user.id
+    await db.change_cash(winner_id, pot)
+    await db.record_gain(winner_id, pot)
+    await db.log_duel(member.id, interaction.user.id, duel_request['choice'], accept_choice, stake, result, winner_id)
+    winner_name = interaction.guild.get_member(winner_id).mention if interaction.guild.get_member(winner_id) else member.mention
+    await interaction.response.send_message(
+        f'{interaction.user.mention} a accepté le duel !\n'
+        f'🃏 Carte tirée : **{card_value}{card_suit}** -> **{result}**\n'
+        f'Gagnant : {winner_name}\n'
+        f'Pot : **${pot}**'
+    )
+
+
+@bot.tree.command(name='declineduel', description='Refuser un duel')
+@app_commands.describe(member='Le membre qui a défié')
+async def slash_declineduel(interaction: discord.Interaction, member: discord.Member):
+    duel_request = PENDING_DUELS.get(member.id)
+    if not duel_request or duel_request['target_id'] != interaction.user.id:
+        await interaction.response.send_message('Aucun duel en attente avec ce membre.', ephemeral=True)
+        return
+    del PENDING_DUELS[member.id]
+    await interaction.response.send_message(f'{interaction.user.mention} a refusé le duel de {member.mention}.')
+
+
+@bot.tree.command(name='kick', description='Expulser un membre du serveur')
+@app_commands.describe(member='Le membre à expulser', reason='Raison de l\'expulsion')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_kick(interaction: discord.Interaction, member: discord.Member, reason: str = 'Aucune raison fournie'):
+    await interaction.guild.kick(member, reason=reason)
+    await action_dm(member, 'expulsé', interaction.user, reason, interaction.guild.name)
+    await interaction.response.send_message(f'{member.mention} a été expulsé pour : {reason}', ephemeral=True)
+
+
+@bot.tree.command(name='ban', description='Bannir un membre du serveur')
+@app_commands.describe(member='Le membre à bannir', reason='Raison du bannissement', delete_days='Nombre de jours de messages à supprimer')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_ban(interaction: discord.Interaction, member: discord.Member, reason: str = 'Aucune raison fournie', delete_days: int = 0):
+    await interaction.guild.ban(member, reason=reason, delete_message_days=max(0, min(delete_days, 7)))
+    await action_dm(member, 'banni', interaction.user, reason, interaction.guild.name)
+    await interaction.response.send_message(f'{member.mention} a été banni pour : {reason}', ephemeral=True)
+
+
+@bot.tree.command(name='mute', description='Rendre un membre muet temporairement')
+@app_commands.describe(member='Le membre à rendre muet', duration='Durée du mute, exemple : 10m, 1h, 24h', reason='Raison du mute')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_mute(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = 'Aucune raison fournie'):
+    seconds = await parse_duration(duration)
+    if seconds is None:
+        await interaction.response.send_message('Format invalide. Exemple : `10m`, `1h`, `24h`.', ephemeral=True)
+        return
+    try:
+        await member.timeout(timedelta(seconds=seconds), reason=reason)
+    except Exception:
+        await interaction.response.send_message('Je ne peux pas mute ce membre.', ephemeral=True)
+        return
+    await action_dm(member, 'mis en mute', interaction.user, reason, interaction.guild.name, duration)
+    await interaction.response.send_message(f'{member.mention} a été mute pendant {duration} pour : {reason}', ephemeral=True)
+
+
+@bot.tree.command(name='unmute', description='Retirer le mute d\'un membre')
+@app_commands.describe(member='Le membre dont on retire le mute', reason='Raison du unmute')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_unmute(interaction: discord.Interaction, member: discord.Member, reason: str = 'Aucune raison fournie'):
+    try:
+        await member.timeout(None, reason=reason)
+    except Exception:
+        await interaction.response.send_message('Je ne peux pas unmute ce membre.', ephemeral=True)
+        return
+    await action_dm(member, 'unmute', interaction.user, reason, interaction.guild.name, extra_text='Tu as été rétabli sur le serveur.')
+    await interaction.response.send_message(f'{member.mention} a été unmute pour : {reason}', ephemeral=True)
+
+
+@bot.tree.command(name='warn', description='Envoyer un avertissement à un membre')
+@app_commands.describe(member='Le membre à avertir', reason='Raison de l\'avertissement')
+@app_commands.checks.has_permissions(administrator=True)
+async def slash_warn(interaction: discord.Interaction, member: discord.Member, reason: str = 'Aucune raison fournie'):
+    await action_dm(member, 'warn', interaction.user, reason, interaction.guild.name, extra_text='Ceci est un avertissement officiel du serveur.')
+    await interaction.response.send_message(f'{member.mention} a reçu un avertissement : {reason}', ephemeral=True)
+
+
+@bot.command(name='duelhistory', aliases=['duelhistory', 'historyduel', 'duel_historique'])
+async def duel_history(ctx):
+    rows = await db.get_duel_history(10)
+    if not rows:
+        await ctx.send('Aucun duel enregistré pour le moment.')
+        return
+    embed = discord.Embed(title='📜 Historique des duels', description='Les 10 derniers duels du serveur', color=QLF_BLUE)
+    lines = []
+    for challenger_id, opponent_id, challenger_choice, opponent_choice, stake, result, winner_id, created_at in rows:
+        challenger = ctx.guild.get_member(challenger_id)
+        opponent = ctx.guild.get_member(opponent_id)
+        winner = ctx.guild.get_member(winner_id)
+        challenger_name = challenger.mention if challenger else f'<@{challenger_id}>'
+        opponent_name = opponent.mention if opponent else f'<@{opponent_id}>'
+        winner_name = winner.mention if winner else f'<@{winner_id}>'
+        lines.append(f"{challenger_name} **{challenger_choice}** vs {opponent_name} **{opponent_choice}** · mise **${stake}** · gagnant {winner_name} · {result}")
+    embed.add_field(name='Derniers duels', value='\n'.join(lines[:10]), inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='duelstats', aliases=['duel_stats', 'duelstat', 'duelstats'])
+async def duel_stats(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    stats = await db.get_duel_stats(target.id)
+    embed = discord.Embed(
+        title=f'⚔️ Stats de duel · {target.display_name}',
+        description=f'Nombre de duels : **{stats["total"]}**',
+        color=QLF_BLUE,
+    )
+    embed.add_field(name='🏆 Victoires', value=str(stats['wins']), inline=True)
+    embed.add_field(name='💀 Défaites', value=str(stats['losses']), inline=True)
+    embed.add_field(name='📈 Winrate', value=f'{stats["winrate"]}%', inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='adminmenu', aliases=['menuadmin'])
+@commands.has_permissions(administrator=True)
+async def admin_menu(ctx):
+    guild = ctx.guild
+    target_channel = guild.get_channel(ADMIN_MENU_CHANNEL_ID)
+    embed = discord.Embed(
+        title='🛡️ Menu d\'administration QLF',
+        description='Liste des commandes admin disponibles sur le serveur.',
+        color=discord.Color.dark_orange(),
+    )
+    embed.add_field(name='⚠️ Avertissements', value='`!warn @membre [raison]`\n`/warn`', inline=False)
+    embed.add_field(name='🔇 Mute', value='`!mute @membre 10m [raison]`\n`/mute @membre 10m [raison]`', inline=False)
+    embed.add_field(name='🔊 Unmute', value='`!unmute @membre [raison]`\n`/unmute @membre [raison]`', inline=False)
+    embed.add_field(name='👢 Kick', value='`!kick @membre [raison]`\n`/kick @membre [raison]`', inline=False)
+    embed.add_field(name='⛔ Ban', value='`!ban @membre [raison]`\n`/ban @membre [raison]`', inline=False)
+    embed.add_field(name='🧹 Clear', value='`!clear 12`\n`/clear 12`', inline=False)
+    embed.set_footer(text='QLF admin menu · commandes réservées aux admins')
+    if target_channel is not None:
+        await target_channel.send(embed=embed)
+        await ctx.send('📣 Menu admin envoyé dans le salon prévu.', delete_after=5)
+    else:
+        await ctx.send(embed=embed)
+
 
 @bot.command(name='leaderboard')
 async def leaderboard(ctx):
@@ -522,6 +1078,16 @@ async def help_command(ctx):
         name='🎨 Personnaliser',
         value='`!shop`  Objets\n`!inventory`  Inventaire\n`!buy galaxy`  Acheter + équiper\n`!equip galaxy`  Changer\n`!setvideo` + vidéo jointe  Afficher\n`!setvideo <lien Tenor>`  Lien vidéo\n`!setvideo off`  Retirer',
         inline=True,
+    )
+    embed.add_field(
+        name='🎮 Mini-jeu : duel',
+        value='`!duel @membre 100 pair`  Défi un joueur avec mise\n`!acc duel @membre impair`  Accepter le duel\n`!dec duel @membre`  Refuser le duel\n`!duelhistory`  Historique des derniers duels\n`!duelstats` / `!duelstats @membre`  Stats des duels\n`/duel @membre 100 pair`  Version slash',
+        inline=False,
+    )
+    embed.add_field(
+        name='🛡️ Modération',
+        value='`!warn @membre [raison]` / `/warn`\n`!mute @membre 10m [raison]` / `/mute`\n`!unmute @membre [raison]` / `/unmute`\n`!kick @membre [raison]` / `/kick`\n`!ban @membre [raison]` / `/ban`',
+        inline=False,
     )
     embed.set_footer(text='QLF · !daily puis !work pour commencer')
     await ctx.send(embed=embed)
@@ -749,14 +1315,30 @@ async def steal(ctx, member: discord.Member):
     await db.set_cooldown(ctx.author.id, 'steal')
     await ctx.send(f"Tu as volé ${amount} à {member.display_name} !")
 
-if __name__ == '__main__':
+async def render_health(request):
+    return web.Response(text='QLF Economy Bot is running')
+
+async def start_render_server():
+    app = web.Application()
+    app.router.add_get('/', render_health)
+    app.router.add_get('/health', render_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv('PORT', '10000'))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f'Render health server listening on port {port}')
+
+async def run_bot():
     token = os.getenv('DISCORD_TOKEN', '').strip()
     if not token:
-        print('ERREUR: le fichier .env est absent ou DISCORD_TOKEN est vide.')
-        print('Crée .env à côté de bot.py avec: DISCORD_TOKEN=TON_NOUVEAU_TOKEN')
-    else:
-        try:
-            bot.run(token)
-        except discord.LoginFailure:
-            print('ERREUR: token Discord invalide ou révoqué.')
-            print('Régénère le token dans Discord Developer Portal > Bot, puis remplace celui de .env.')
+        print('ERREUR: DISCORD_TOKEN est absent.')
+        return
+    await start_render_server()
+    try:
+        await bot.start(token)
+    except discord.LoginFailure:
+        print('ERREUR: token Discord invalide ou révoqué.')
+
+if __name__ == '__main__':
+    asyncio.run(run_bot())
